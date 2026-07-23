@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+streamlit>=1.37
+opencv-python-headless>=4.9
+numpy>=1.26,<2.0
+pandas>=2.1
+pillow>=10.0
+gdown>=5.1
+torch>=2.2
+torchvision>=0.17
+ultralytics>=8.2
+openpyxl>=3.1

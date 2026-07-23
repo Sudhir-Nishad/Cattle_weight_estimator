@@ -5,41 +5,11 @@ Model loading, YOLO+KeypointRCNN inference, trait/weight computation, and
 annotation drawing for the Cattle Weight Estimation Streamlit app.
 
 Only the SIDE-VIEW is used:
-  - Segmentation model (best.pt)      -> locates cow + calibration sticker
+  - Segmentation model (best.pt)           -> locates cow + calibration sticker
   - Side KeypointRCNN (best_model_side.pth) -> locates 15 side-view keypoints
 
 Weight formula (Schaeffer's girth-length formula, metric):
     weight_kg = (heart_girth_cm ** 2 * body_length_cm) / 10840
-
-------------------------------------------------------------------------------
-CHANGES FROM THE ORIGINAL VERSION (see comments tagged "# CHANGED:")
-------------------------------------------------------------------------------
-1. Google Drive / gdown downloading has been removed from the default path.
-   Google Drive is not a reliable production model host (no resumable
-   downloads, virus-scan interstitials on large files, rate limits) and,
-   combined with Render's ephemeral filesystem, it was causing the model to
-   re-download on every container restart -> slow boot -> Render proxy
-   502s -> restart loop.
-
-2. Models are now expected to be baked directly into the Docker image at
-   MODEL_DIR (default "models/"). This means zero network calls at
-   startup, the fastest possible cold start, and nothing to re-download
-   ever, because the files are already on disk the instant the container
-   boots.
-
-3. An OPTIONAL fallback remains for teams that don't want to rebuild the
-   Docker image every time the model changes: if the baked-in files are
-   missing, and MODEL_CACHE_DIR + HF_MODEL_REPO env vars are set, models
-   are pulled once from a Hugging Face Hub model repo (resumable,
-   versioned, no interstitials) into MODEL_CACHE_DIR. For this fallback to
-   actually avoid repeated downloads on Render, MODEL_CACHE_DIR MUST point
-   at a mounted Render Persistent Disk (e.g. /var/data/models) — otherwise
-   you are back to the exact same ephemeral-storage problem, just with a
-   nicer download client.
-
-4. load_models() / build_keypoint_rcnn() signatures are UNCHANGED, so
-   app.py's `load_models(progress_callback=progress)` call keeps working
-   with no edits required there.
 ==============================================================================
 """
 
@@ -49,32 +19,20 @@ import math
 import cv2
 import numpy as np
 import torch
+import gdown
 import torchvision.transforms.functional as TF
 from PIL import Image
 
 # ─────────────────────────────────────────────────────────────────────────
-# Model file locations
+# Google Drive model files
 # ─────────────────────────────────────────────────────────────────────────
-# CHANGED: MODEL_DIR is where the app looks FIRST — this is meant to be the
-# path the Docker image bakes the checkpoints into. Override via env var
-# only if you truly need to (e.g. local dev with a different layout).
-MODEL_DIR = os.environ.get("MODEL_DIR", "models")
+SIDE_RESNET_FILE_ID = "1YoAQZl1UbTmKKUER3GvrPoX0vaeKlY_n"   # best_model_side.pth
+SEG_MODEL_FILE_ID = "1cS-gyETpREAkoADcWT7IntMNy5eWGLAf"      # best.pt
 
-# CHANGED: MODEL_CACHE_DIR is the fallback download target. Point this at a
-# mounted Render Persistent Disk (e.g. "/var/data/models") if you use the
-# Hugging Face Hub fallback below. If unset, it defaults to MODEL_DIR, which
-# is fine ONLY if MODEL_DIR itself is a persistent/baked-in location.
-MODEL_CACHE_DIR = os.environ.get("MODEL_CACHE_DIR", MODEL_DIR)
-
-# CHANGED: optional Hugging Face Hub repo id, e.g. "your-username/cattle-weight-models"
-# Only used if the baked-in files are not found. Leave unset if you bake
-# models into the image (recommended).
-HF_MODEL_REPO = os.environ.get("HF_MODEL_REPO", "")
-HF_SEG_FILENAME = os.environ.get("HF_SEG_FILENAME", "best.pt")
-HF_SIDE_FILENAME = os.environ.get("HF_SIDE_FILENAME", "best_model_side.pth")
-
-SEG_MODEL_PATH = os.path.join(MODEL_DIR, "best.pt")
-SIDE_RESNET_PATH = os.path.join(MODEL_DIR, "best_model_side.pth")
+# Support Render persistent disk environment variable if configured
+MODELS_DIR = os.environ.get("MODEL_CACHE_DIR", os.environ.get("MODELS_DIR", "models"))
+SIDE_RESNET_PATH = os.path.join(MODELS_DIR, "best_model_side.pth")
+SEG_MODEL_PATH = os.path.join(MODELS_DIR, "best.pt")
 
 STICKER_CM_DEFAULT = 15.0
 
@@ -90,61 +48,67 @@ SKP = {n: i for i, n in enumerate(SIDE_KP_NAMES)}
 
 
 # ==============================================================================
-# Model resolution: baked-in first, optional HF Hub fallback second
+# Model download + loading
 # ==============================================================================
-def _hf_hub_fallback_download(filename, progress_callback=None):
-    """
-    Only invoked if a required model file is missing from MODEL_DIR.
-    Downloads once from Hugging Face Hub into MODEL_CACHE_DIR (which should
-    be a persistent disk mount on Render) and returns the local path.
-    Uses huggingface_hub's built-in local caching + resumable download, so
-    re-running this after the first successful download is a fast no-op
-    (it checks ETags rather than re-downloading the whole file).
-    """
-    if not HF_MODEL_REPO:
-        raise FileNotFoundError(
-            f"Model file '{filename}' was not found in '{MODEL_DIR}', and no "
-            f"HF_MODEL_REPO fallback is configured. Bake the model into the "
-            f"Docker image at that path, or set HF_MODEL_REPO (and ideally "
-            f"MODEL_CACHE_DIR pointed at a Render Persistent Disk)."
-        )
-    from huggingface_hub import hf_hub_download
-
-    if progress_callback:
-        progress_callback(f"Downloading {filename} from Hugging Face Hub (first run only)...")
-
-    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
-    local_path = hf_hub_download(
-        repo_id=HF_MODEL_REPO,
-        filename=filename,
-        local_dir=MODEL_CACHE_DIR,
-    )
-    return local_path
-
-
 def ensure_models_downloaded(progress_callback=None):
     """
-    Resolves paths to the segmentation and keypoint model files.
-
-    Order of resolution:
-      1. Baked-in / already-cached file at MODEL_DIR — no network call.
-      2. Hugging Face Hub fallback (only if configured) — downloads once
-         into MODEL_CACHE_DIR, which should be a persistent disk.
-
-    Google Drive downloading has been intentionally removed (see module
-    docstring for why).
+    Ensure models exist on disk.
+    Checks local directory first, then Hugging Face (if HF_MODEL_REPO env var set),
+    and falls back to Google Drive via gdown.
     """
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    hf_repo = os.environ.get("HF_MODEL_REPO")
 
-    seg_path = SEG_MODEL_PATH
-    if not os.path.exists(seg_path):
-        seg_path = _hf_hub_fallback_download(HF_SEG_FILENAME, progress_callback)
+    # 1. Check or download segmentation model (best.pt)
+    if not os.path.exists(SEG_MODEL_PATH):
+        if hf_repo:
+            if progress_callback:
+                progress_callback(f"Downloading best.pt from Hugging Face ({hf_repo})...")
+            try:
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(repo_id=hf_repo, filename="best.pt", local_dir=MODELS_DIR)
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"HF download failed ({e}), falling back to Google Drive...")
+        
+        if not os.path.exists(SEG_MODEL_PATH):
+            if progress_callback:
+                progress_callback("Downloading segmentation model (best.pt)...")
+            url = f"https://drive.google.com/uc?id={SEG_MODEL_FILE_ID}"
+            gdown.download(url, SEG_MODEL_PATH, quiet=False, fuzzy=True)
 
-    side_path = SIDE_RESNET_PATH
-    if not os.path.exists(side_path):
-        side_path = _hf_hub_fallback_download(HF_SIDE_FILENAME, progress_callback)
+    # 2. Check or download side keypoint model (best_model_side.pth)
+    if not os.path.exists(SIDE_RESNET_PATH):
+        if hf_repo:
+            if progress_callback:
+                progress_callback(f"Downloading best_model_side.pth from Hugging Face ({hf_repo})...")
+            try:
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(repo_id=hf_repo, filename="best_model_side.pth", local_dir=MODELS_DIR)
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"HF download failed ({e}), falling back to Google Drive...")
 
-    return seg_path, side_path
+        if not os.path.exists(SIDE_RESNET_PATH):
+            if progress_callback:
+                progress_callback("Downloading side keypoint model (best_model_side.pth)...")
+            url = f"https://drive.google.com/uc?id={SIDE_RESNET_FILE_ID}"
+            gdown.download(url, SIDE_RESNET_PATH, quiet=False, fuzzy=True)
+
+    # Validate that files exist after download attempts
+    if not os.path.exists(SEG_MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model file 'best.pt' was not found in '{MODELS_DIR}'. "
+            "Please ensure model files are uploaded to the models directory or set HF_MODEL_REPO."
+        )
+
+    if not os.path.exists(SIDE_RESNET_PATH):
+        raise FileNotFoundError(
+            f"Model file 'best_model_side.pth' was not found in '{MODELS_DIR}'. "
+            "Please ensure model files are uploaded to the models directory or set HF_MODEL_REPO."
+        )
+
+    return SEG_MODEL_PATH, SIDE_RESNET_PATH
 
 
 def build_keypoint_rcnn(num_keypoints, min_size, max_size, weights_path, device):
@@ -226,10 +190,10 @@ def _sticker_px_from_corners(corners):
 # Inference
 # ==============================================================================
 def run_side_inference(yolo_model, resnet_model, img_bgr, device,
-                        sticker_cm=STICKER_CM_DEFAULT, score_thresh=0.3):
+                       sticker_cm=STICKER_CM_DEFAULT, score_thresh=0.3):
     """
     Returns a dict with either:
-      {"error": "..."}                                     on failure, or
+      {"error": "..."}                                 on failure, or
       {"pred_kps", "box", "cmp", "corners"}                 on success
     """
     h_orig, w_orig = img_bgr.shape[:2]

@@ -75,7 +75,7 @@ def ensure_models_downloaded(progress_callback=None):
             if progress_callback:
                 progress_callback("Downloading segmentation model (best.pt)...")
             url = f"https://drive.google.com/uc?id={SEG_MODEL_FILE_ID}"
-            gdown.download(url, SEG_MODEL_PATH, quiet=False, fuzzy=True)
+            gdown.download(url, SEG_MODEL_PATH, quiet=False)
 
     # 2. Check or download side keypoint model (best_model_side.pth)
     if not os.path.exists(SIDE_RESNET_PATH):
@@ -93,7 +93,7 @@ def ensure_models_downloaded(progress_callback=None):
             if progress_callback:
                 progress_callback("Downloading side keypoint model (best_model_side.pth)...")
             url = f"https://drive.google.com/uc?id={SIDE_RESNET_FILE_ID}"
-            gdown.download(url, SIDE_RESNET_PATH, quiet=False, fuzzy=True)
+            gdown.download(url, SIDE_RESNET_PATH, quiet=False)
 
     # Validate that files exist after download attempts
     if not os.path.exists(SEG_MODEL_PATH):

@@ -16,6 +16,21 @@ Workflow:
   6. Sidebar "View All Logs" button opens a dialog listing every past
      measurement as an expandable card per Tag ID + timestamp, with an
      "Download Excel" button for the full log.
+
+------------------------------------------------------------------------------
+CHANGES FROM THE ORIGINAL VERSION (search "# CHANGED:" for each spot)
+------------------------------------------------------------------------------
+1. LOGS_PATH now lives under DATA_DIR (env var, defaults to "logs" so local
+   behavior is identical to before). On Render, point DATA_DIR at a mounted
+   Persistent Disk (e.g. "/var/data") so the measurement log survives
+   restarts/redeploys instead of resetting every time the ephemeral
+   filesystem is wiped.
+2. get_models() now catches load failures and surfaces a clear, visible
+   error in the UI instead of letting Streamlit hang or crash silently —
+   this makes a misconfigured deploy (e.g. missing model file) fail fast
+   and loud rather than looking like a slow-timeout 502.
+Everything else — layout, CSS, session-state keys, dialogs, inference
+call sites, the weight formula — is unchanged.
 ==============================================================================
 """
 
@@ -42,7 +57,13 @@ from utils import (
 # Page config + branding
 # ==============================================================================
 LOGO_PATH = "assets/logo.png"
-LOGS_PATH = "logs/cattle_weight_logs.csv"
+
+# CHANGED: DATA_DIR lets you point log storage at a persistent disk on Render.
+# Defaults to "." so local/dev behavior (logs/cattle_weight_logs.csv) is
+# unchanged if you don't set the env var.
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+LOGS_PATH = os.path.join(DATA_DIR, "logs", "cattle_weight_logs.csv")
+
 LOG_COLUMNS = [
     "Tag_ID", "Date", "Time",
     "Linear_Body_Depth_cm", "Linear_Chest_Height_cm",
@@ -250,7 +271,7 @@ for key, default in DEFAULTS.items():
         st.session_state[key] = default
 
 if st.session_state.logs_df is None:
-    os.makedirs("logs", exist_ok=True)
+    os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
     if os.path.exists(LOGS_PATH):
         st.session_state.logs_df = pd.read_csv(LOGS_PATH)
     else:
@@ -313,7 +334,21 @@ def get_models():
     def progress(msg):
         status.info(msg)
 
-    yolo_model, resnet_model, device = load_models(progress_callback=progress)
+    try:
+        yolo_model, resnet_model, device = load_models(progress_callback=progress)
+    except Exception as exc:
+        # CHANGED: surface a clear, actionable error instead of letting the
+        # exception propagate into a generic Streamlit crash / hang, which on
+        # Render looks like a slow request that eventually 502s.
+        status.empty()
+        st.error(
+            "Model loading failed. This is almost always a missing/misconfigured "
+            "model file path, not a transient issue.\n\n"
+            f"Details: {exc}"
+        )
+        st.stop()
+        raise
+
     status.empty()
     return yolo_model, resnet_model, device
 
@@ -476,7 +511,7 @@ with col_form:
     )
 
     st.subheader("2. Side-View Image")
-    
+
     tab_upload, tab_camera = st.tabs(["📁 Upload Image", "📷 Take Photo"])
 
     uploaded_file = None
@@ -574,7 +609,7 @@ if estimate_clicked:
                         [st.session_state.logs_df, pd.DataFrame([new_row])],
                         ignore_index=True,
                     )
-                    os.makedirs("logs", exist_ok=True)
+                    os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
                     st.session_state.logs_df.to_csv(LOGS_PATH, index=False)
 
                     st.rerun()
